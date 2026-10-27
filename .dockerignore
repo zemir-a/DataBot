@@ -1,0 +1,9 @@
+venv
+DataBot
+.gradio
+.git
+__pycache__
+users.json
+sessions.json
+.env
+model
