@@ -4,3 +4,4 @@ datasets
 accelerate
 sentencepiece
 pypdf
+gradio==6.30.0

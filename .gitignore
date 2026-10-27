@@ -218,3 +218,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Private data (never upload these)
+users.json
+sessions.json
+.env
+
+# Gradio and Python junk
+.gradio/
+__pycache__/
+venv/
+DataBot/venv/
+.venv/
+*.pyc
+# Nested virtual environment
+DataBot/venv/
+DataBot/.git/
+
+/DataBot/
