@@ -1,27 +1,33 @@
-"""PDF -> MCQs. This is the one function the app calls.
+"""Notes -> MCQs. The app calls generate_mcqs (file) or generate_from_text (pasted text).
 
-Returns a list of dicts:
-    {"question": str, "options": [4 strings], "answer_index": int}
+Each result: {"question": str, "options": [4 strings], "answer_index": int}
 """
 import random
 import re
 
-import torch
 from pypdf import PdfReader
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-# The fine-tuned model published on Hugging Face (trained with train_sciq.py).
-# While testing locally you can point it at a saved folder instead, e.g. "sciq-mcq-t5-final".
-MODEL_ID = "banwaa/mcq-generator"
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-tok = AutoTokenizer.from_pretrained(MODEL_ID)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_ID).to(device)
-model.eval()
-
-# Each passage gets a random length between these two values, so questions vary.
+MODEL_ID = "banwaa/generator-mcq"
 MIN_WORDS = 100
 MAX_WORDS = 200
+
+_tok = None
+_model = None
+_device = None
+
+
+def _load():
+    """Load the model the first time it is needed, not when the app starts."""
+    global _tok, _model, _device
+    if _model is None:
+        import torch
+        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+        _device = "cuda" if torch.cuda.is_available() else "cpu"
+        _tok = AutoTokenizer.from_pretrained(MODEL_ID)
+        _model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_ID).to(_device)
+        _model.eval()
+    return _tok, _model, _device
 
 
 def norm(s):
@@ -39,6 +45,9 @@ def parse(text):
 
 
 def make_mcq(passage, tries=8):
+    import torch
+
+    tok, model, device = _load()
     inputs = tok("generate mcq: " + passage, return_tensors="pt", truncation=True, max_length=512)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -85,26 +94,30 @@ def make_mcq(passage, tries=8):
     return {"question": best["question"], "answer": best["answer"], "distractors": pool[:3]}
 
 
-def extract_text(pdf_path):
-    reader = PdfReader(pdf_path)
+def extract_text(path):
+    path = str(path)
+    if path.lower().endswith(".txt"):
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    reader = PdfReader(path)
     return " ".join((page.extract_text() or "") for page in reader.pages)
 
 
-def generate_mcqs(pdf_path, num_questions=5):
-    text = extract_text(pdf_path)
+def generate_from_text(text, num_questions=5):
     words = text.split()
     if len(words) < 50:
-        raise ValueError("Not enough text in this PDF. If it's scanned, it needs OCR first.")
+        raise ValueError(
+            "Not enough text to make questions. If this is a scanned PDF, it needs OCR first."
+        )
 
     chunks = []
     i = 0
     while i < len(words):
-        size = random.randint(MIN_WORDS, MAX_WORDS)  # a new random length each time
+        size = random.randint(MIN_WORDS, MAX_WORDS)
         chunks.append(" ".join(words[i:i + size]))
         i += size
-    chunks = [c for c in chunks if len(c.split()) >= 50]  # drop tiny leftovers
+    chunks = [c for c in chunks if len(c.split()) >= 50]
 
-    # Spread questions across the whole document, not just the first pages
     order = list(range(len(chunks)))
     random.shuffle(order)
 
@@ -127,3 +140,8 @@ def generate_mcqs(pdf_path, num_questions=5):
             }
         )
     return results
+
+
+def generate_mcqs(path, num_questions=5):
+    """Works for .pdf and .txt files."""
+    return generate_from_text(extract_text(path), num_questions)

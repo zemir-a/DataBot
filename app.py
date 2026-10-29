@@ -2,7 +2,7 @@ import base64
 import hashlib
 import hmac
 import inspect
-import json
+import math
 import os
 import re
 import secrets
@@ -11,15 +11,17 @@ from pathlib import Path
 
 import gradio as gr
 
+import db
+import scoring
+from model.generate_mcq import generate_from_text, generate_mcqs
+
 # ---------------------------------------------------------
 # Files: logo at DataBot/assets/knowva-logo.png
-#        accounts are saved in DataBot/users.json
-#        login sessions are saved in DataBot/sessions.json
+# Accounts, login sessions, quizzes and scores live in the
+# Postgres database set by the DATABASE_URL environment variable.
 # ---------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 LOGO_PATH = BASE_DIR / "assets" / "knowva-logo.png"
-USERS_FILE = BASE_DIR / "users.json"
-SESSIONS_FILE = BASE_DIR / "sessions.json"
 
 SESSION_DAYS = 30  # how long you stay logged in (change this number if you like)
 
@@ -35,28 +37,15 @@ def logo_as_text(path):
 
 LOGO_DATA = logo_as_text(LOGO_PATH)
 
+# Create the database tables if they don't exist yet.
+# This stops with a clear error if DATABASE_URL is not set.
+db.init_db()
+
 
 # ---------------------------------------------------------
-# Accounts (simple version for the hackathon)
+# Accounts (stored in the database)
 # ---------------------------------------------------------
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-def _read_json(path):
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-
-def load_users():
-    return _read_json(USERS_FILE)
-
-
-def save_users(users):
-    USERS_FILE.write_text(json.dumps(users, indent=2))
 
 
 def hash_password(password, salt=None):
@@ -78,32 +67,26 @@ def _token_key(token):
 
 
 def create_session(email):
-    now = time.time()
-    sessions = {k: v for k, v in _read_json(SESSIONS_FILE).items() if v["expires"] > now}
     token = secrets.token_urlsafe(32)
-    sessions[_token_key(token)] = {"email": email, "expires": now + SESSION_DAYS * 86400}
-    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+    db.create_session(_token_key(token), email, time.time() + SESSION_DAYS * 86400)
     return token
 
 
 def user_from_token(token):
     if not token:
         return None
-    session = _read_json(SESSIONS_FILE).get(_token_key(token))
+    session = db.get_session(_token_key(token))
     if not session or session["expires"] < time.time():
         return None
-    record = load_users().get(session["email"])
+    record = db.get_user(session["email"])
     if not record:
         return None
-    return {"name": record["name"], "email": session["email"], "level": record["level"]}
+    return {"name": record["name"], "email": record["email"], "level": record["level"]}
 
 
 def end_session(token):
-    if not token:
-        return
-    sessions = _read_json(SESSIONS_FILE)
-    if sessions.pop(_token_key(token), None) is not None:
-        SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+    if token:
+        db.delete_session(_token_key(token))
 
 
 # ---------------------------------------------------------
@@ -434,7 +417,7 @@ def _fail(message):
 
 def log_in(email, password):
     email = (email or "").strip().lower()
-    record = load_users().get(email)
+    record = db.get_user(email)
     if not record:
         return _fail("Wrong email or password.")
     _, digest = hash_password(password or "", record["salt"])
@@ -454,12 +437,10 @@ def sign_up(name, email, level, password, confirm):
         return _fail("Your password needs at least 8 characters.")
     if password != confirm:
         return _fail("The two passwords don't match.")
-    users = load_users()
-    if email in users:
+    if db.get_user(email):
         return _fail("An account with this email already exists. Try logging in.")
     salt, digest = hash_password(password)
-    users[email] = {"name": name, "level": level, "salt": salt, "hash": digest}
-    save_users(users)
+    db.create_user(email, name, level, salt, digest)
     return _success({"name": name, "email": email, "level": level})
 
 
@@ -485,26 +466,159 @@ def log_out(token):
 
 
 # ---------------------------------------------------------
-# Other button actions (placeholders for now)
+# Creating a quiz
 # ---------------------------------------------------------
-def check_answer(choice):
-    if not choice:
-        return "Pick an answer first."
-    if choice.startswith("B"):
-        return "✓ Correct! **+100 XP** (XP saving is coming soon)"
-    return "Not quite. Hint: think about what happens to acceleration when you push harder."
+def generate_quiz(user, file, notes, count, seconds, max_players):
+    if not user:
+        return "Please log in first."
+    notes = (notes or "").strip()
+    if file is None and not notes:
+        return "Upload a PDF or TXT file, or paste your notes first."
+    try:
+        if file is not None:
+            path = file if isinstance(file, str) else file.name
+            questions = generate_mcqs(path, int(count))
+            title = Path(path).stem[:60]
+        else:
+            questions = generate_from_text(notes, int(count))
+            title = notes[:40]
+    except ValueError as e:
+        return f"⚠️ {e}"
+    if not questions:
+        return "⚠️ Couldn't make questions from this text. Try longer or clearer notes."
+    code = db.create_quiz(user["email"], title, int(seconds), int(max_players), questions)
+    return (
+        f"✓ Quiz ready with {len(questions)} questions.\n\n"
+        f"## Game code: {code}\n"
+        f"Share this code. Up to {int(max_players)} players can join."
+    )
 
 
-def generate_quiz(file, topic, count):
-    if file is None and not (topic or "").strip():
-        return "Upload your notes or type a topic first."
-    return "The AI question generator is coming soon. We will connect it next!"
+# ---------------------------------------------------------
+# Playing a game
+# join_game and submit_answer return values for these outputs, in this order:
+# play_state, join_msg, join_form, play_col, play_q, play_choice,
+# play_clock, play_msg, play_timer
+# ---------------------------------------------------------
+def _play_fail(message):
+    return [gr.skip(), f"⚠️ {message}"] + [gr.skip()] * 7
 
 
-def join_game(code, nickname):
-    if not (code or "").strip() or not (nickname or "").strip():
-        return "Enter a game code and a nickname."
-    return "Live games are coming soon. We will add real game rooms next!"
+def _question_view(ps):
+    q = db.get_question(ps["ids"][ps["i"]])
+    ps["started"] = time.time()
+    choices = [f"{'ABCD'[n]}. {o}" for n, o in enumerate(q["options"])]
+    head = f'<span class="eyebrow">QUESTION {ps["i"] + 1} OF {len(ps["ids"])}</span>'
+    return (
+        f"{head}\n### {q['question']}",
+        gr.update(choices=choices, value=None),
+        f"⏱ {ps['limit']}s",
+    )
+
+
+def join_game(user, code, nickname):
+    if not user:
+        return _play_fail("Please log in first.")
+    code = (code or "").strip()
+    nickname = (nickname or "").strip().replace("|", "/")[:30]
+    if not code or not nickname:
+        return _play_fail("Enter a game code and a nickname.")
+    ok, msg = db.join_quiz(code, user["email"], nickname)
+    if not ok:
+        return _play_fail(msg)
+    done = db.answered_ids(code, user["email"])
+    ids = [i for i in db.question_ids(code) if i not in done]
+    if not ids:
+        return _play_fail("You have already finished this game. Check the Ranks page.")
+    quiz = db.get_quiz(code)
+    ps = {
+        "code": code, "email": user["email"], "ids": ids, "i": 0,
+        "limit": quiz["seconds_per_question"], "started": 0,
+    }
+    q_md, choice, clock = _question_view(ps)
+    return [
+        ps, "", gr.update(visible=False), gr.update(visible=True),
+        q_md, choice, clock, "", gr.Timer(active=True),
+    ]
+
+
+def submit_answer(user, ps, choice):
+    if not user or not ps or ps.get("email") != user["email"]:
+        return _play_fail("Join a game first.")
+    q_id = ps["ids"][ps["i"]]
+    q = db.get_question(q_id)
+    used = time.time() - ps["started"]
+    if not choice and used <= ps["limit"]:
+        return [gr.skip()] * 7 + ["Pick an answer first."] + [gr.skip()]
+
+    chosen = "ABCD".index(choice[0]) if choice else None
+    correct = chosen == q["answer_index"]
+    points = scoring.points_for(correct, used, ps["limit"])
+    db.save_attempt(ps["code"], user["email"], q_id, chosen, correct, used, points)
+
+    right = f"{'ABCD'[q['answer_index']]}. {q['options'][q['answer_index']]}"
+    if correct and points:
+        feedback = f"✓ Correct! **+{points} XP**"
+    elif correct:
+        feedback = "✓ Correct, but too late for points."
+    else:
+        feedback = f"✗ Not quite. The answer was **{right}**."
+
+    ps["i"] += 1
+    if ps["i"] >= len(ps["ids"]):
+        xp, right_count, answered = db.player_score(ps["code"], user["email"])
+        final = (
+            f"{feedback}\n\n🏁 Finished! You scored **{xp} XP** "
+            f"({right_count} of {answered} correct). Check the Ranks page."
+        )
+        return [
+            None, final, gr.update(visible=True), gr.update(visible=False),
+            "", gr.update(choices=[], value=None), "", "", gr.Timer(active=False),
+        ]
+    q_md, choice_update, clock = _question_view(ps)
+    return [ps, "", gr.skip(), gr.skip(), q_md, choice_update, clock, feedback, gr.skip()]
+
+
+def tick(ps):
+    """Countdown display only. The real time check happens in submit_answer."""
+    if not ps:
+        return gr.skip()
+    left = ps["limit"] - (time.time() - ps["started"])
+    if left > 0:
+        return f"⏱ {math.ceil(left)}s"
+    return "⏰ Time's up. Submit to move on (0 points)."
+
+
+# ---------------------------------------------------------
+# Leaderboard and Home stats
+# ---------------------------------------------------------
+def render_board(code):
+    rows = db.leaderboard((code or "").strip() or None)
+    header = "| RANK | PLAYER | XP |\n|---|---|---|\n"
+    if not rows:
+        return header + "| - | No scores yet | - |"
+    return header + "\n".join(
+        f"| {i} | {str(r['name']).replace('|', '/')} | {int(r['xp'] or 0):,} |"
+        for i, r in enumerate(rows, 1)
+    )
+
+
+def refresh_stats(user):
+    if not user:
+        return gr.skip(), gr.skip(), gr.skip()
+    s = db.user_stats(user["email"])
+    return (
+        f'<span class="eyebrow">TOTAL XP</span>\n# {s["xp"]:,}',
+        f'<span class="eyebrow">QUIZZES PLAYED</span>\n# {s["played"]}',
+        f'<span class="eyebrow">DAY STREAK</span>\n# {s["streak"]}',
+    )
+
+
+def timer_for(view):
+    """The Ranks page refreshes itself every few seconds, only while it is open."""
+    def _t():
+        return gr.Timer(active=(view == "board"))
+    return _t
 
 
 # ---------------------------------------------------------
@@ -528,6 +642,11 @@ else:
 with gr.Blocks(**blocks_options) as demo:
 
     user_state = gr.State(None)
+    play_state = gr.State(None)  # the game the player is in right now (kept on the server)
+
+    # Timers have no visible part. They sit here so they keep working on every page.
+    play_timer = gr.Timer(1, active=False)   # question countdown
+    board_timer = gr.Timer(5, active=False)  # refreshes the Ranks page
 
     # Lives in the browser, so it survives refreshes and closing the tab.
     # The storage_key and secret are fixed so it still works after you restart the app.
@@ -610,37 +729,25 @@ with gr.Blocks(**blocks_options) as demo:
 
                 with gr.Row():
                     with gr.Column(elem_classes=["card", "stat", "centered"], min_width=200):
-                        gr.Markdown('<span class="eyebrow">TOTAL XP</span>\n# 0')
+                        xp_md = gr.Markdown('<span class="eyebrow">TOTAL XP</span>\n# 0')
                     with gr.Column(elem_classes=["card", "stat", "centered"], min_width=200):
-                        gr.Markdown('<span class="eyebrow">QUIZZES PLAYED</span>\n# 0')
+                        played_md = gr.Markdown('<span class="eyebrow">QUIZZES PLAYED</span>\n# 0')
                     with gr.Column(elem_classes=["card", "stat", "centered"], min_width=200):
-                        gr.Markdown('<span class="eyebrow">DAY STREAK</span>\n# 0')
+                        streak_md = gr.Markdown('<span class="eyebrow">DAY STREAK</span>\n# 0')
 
                 with gr.Row(equal_height=False):
-                    with gr.Column(scale=1, min_width=300):
-                        with gr.Column(elem_classes="card"):
-                            gr.Markdown(
-                                "### ✦ Create a Quiz\n"
-                                "Turn your notes or a PDF into practice questions."
-                            )
-                            home_create = gr.Button("Create a Quiz", elem_id="create-btn")
-                        with gr.Column(elem_classes="card"):
-                            gr.Markdown(
-                                "### ↗ Join a Game\n"
-                                "Enter a game code and compete with friends."
-                            )
-                            home_join = gr.Button("Join a Game", elem_id="create-btn")
-
-                    with gr.Column(scale=1, min_width=300, elem_classes="quiz-card"):
-                        gr.Markdown('<span class="eyebrow">DAILY CHALLENGE  ·  ★ +100 XP</span>')
-                        gr.Markdown("### Which law states that force equals mass times acceleration?")
-                        answer = gr.Radio(
-                            ["A. Newton's first law", "B. Newton's second law",
-                             "C. Newton's third law", "D. Hooke's law"],
-                            show_label=False,
+                    with gr.Column(elem_classes="card", min_width=300):
+                        gr.Markdown(
+                            "### ✦ Create a Quiz\n"
+                            "Turn your notes or a PDF into practice questions."
                         )
-                        check_btn = gr.Button("Check answer", elem_id="check-btn")
-                        answer_msg = gr.Markdown("")
+                        home_create = gr.Button("Create a Quiz", elem_id="create-btn")
+                    with gr.Column(elem_classes="card", min_width=300):
+                        gr.Markdown(
+                            "### ↗ Join a Game\n"
+                            "Enter a game code and compete with friends."
+                        )
+                        home_join = gr.Button("Join a Game", elem_id="create-btn")
 
             # ----- EXPLORE -----
             with gr.Column(visible=False, elem_classes="view") as view_explore:
@@ -671,8 +778,16 @@ with gr.Blocks(**blocks_options) as demo:
                 )
                 with gr.Column(elem_classes="card"):
                     notes_file = gr.File(label="Upload notes (PDF or TXT)", file_types=[".pdf", ".txt"])
-                    topic_box = gr.Textbox(label="Or type a topic", placeholder="e.g. Newton's laws of motion")
+                    notes_box = gr.Textbox(
+                        label="Or paste your notes",
+                        lines=6,
+                        placeholder="Paste a few paragraphs of your notes here",
+                    )
                     count_slider = gr.Slider(5, 20, value=10, step=1, label="Number of questions")
+                    seconds_slider = gr.Slider(10, 60, value=30, step=5, label="Seconds per question")
+                    max_players = gr.Number(
+                        value=30, minimum=1, maximum=200, precision=0, label="Max players"
+                    )
                     generate_btn = gr.Button("✦  Generate questions", elem_id="generate-btn")
                     generate_msg = gr.Markdown("")
 
@@ -682,11 +797,19 @@ with gr.Blocks(**blocks_options) as demo:
                     '<span class="eyebrow">// JOIN</span>\n## Enter a game',
                     elem_classes=["title", "centered"],
                 )
-                with gr.Column(elem_classes="card"):
+                with gr.Column(elem_classes="card") as join_form:
                     code_box = gr.Textbox(label="Game code", placeholder="e.g. 482915")
                     nick_box = gr.Textbox(label="Nickname")
                     join_btn = gr.Button("Join game  →", elem_id="join-game-btn")
                     join_msg = gr.Markdown("")
+
+                # The quiz itself. Shown instead of the form while you are playing.
+                with gr.Column(visible=False, elem_classes="quiz-card") as play_col:
+                    play_q = gr.Markdown("")
+                    play_clock = gr.Markdown("")
+                    play_choice = gr.Radio([], show_label=False)
+                    play_submit = gr.Button("Submit answer", elem_id="check-btn")
+                    play_msg = gr.Markdown("")
 
             # ----- RANKS -----
             with gr.Column(visible=False, elem_classes="view") as view_board:
@@ -695,14 +818,12 @@ with gr.Blocks(**blocks_options) as demo:
                     elem_classes=["title", "centered"],
                 )
                 with gr.Column(elem_classes=["card", "board"]):
-                    gr.Markdown(
-                        "| RANK | PLAYER | XP |\n"
-                        "|---|---|---|\n"
-                        "| 1 | Sample player | 1,200 |\n"
-                        "| 2 | Sample player | 950 |\n"
-                        "| 3 | Sample player | 800 |\n\n"
-                        "*Sample data. Live scores are coming soon.*"
+                    board_code = gr.Textbox(
+                        label="Game code (leave empty for the overall ranking)",
+                        placeholder="e.g. 482915",
                     )
+                    board_btn = gr.Button("Refresh")
+                    board_md = gr.Markdown("")
 
             view_columns = [view_home, view_explore, view_create, view_join, view_board]
 
@@ -715,6 +836,11 @@ with gr.Blocks(**blocks_options) as demo:
     # Wiring: what each button does
     # =========================================================
     nav_outputs = view_columns + nav_buttons
+    stats_outputs = [xp_md, played_md, streak_md]
+    play_outputs = [
+        play_state, join_msg, join_form, play_col, play_q,
+        play_choice, play_clock, play_msg, play_timer,
+    ]
 
     for button, name in zip(nav_buttons, VIEWS):
         button.click(
@@ -738,13 +864,13 @@ with gr.Blocks(**blocks_options) as demo:
         inputs=[login_email, login_pw],
         outputs=auth_outputs,
         show_progress="hidden",
-    )
+    ).then(refresh_stats, user_state, stats_outputs, show_progress="hidden")
     signup_btn.click(
         sign_up,
         inputs=[su_name, su_email, su_level, su_pw, su_confirm],
         outputs=auth_outputs,
         show_progress="hidden",
-    )
+    ).then(refresh_stats, user_state, stats_outputs, show_progress="hidden")
     logout_btn.click(
         log_out,
         inputs=session_token,
@@ -758,18 +884,42 @@ with gr.Blocks(**blocks_options) as demo:
         inputs=session_token,
         outputs=[user_state, loading_view, auth_view, app_view, greeting] + nav_outputs,
         show_progress="hidden",
-    )
+    ).then(refresh_stats, user_state, stats_outputs, show_progress="hidden")
 
-    check_btn.click(check_answer, inputs=answer, outputs=answer_msg, show_progress="hidden")
+    # Home: refresh the XP, quizzes played and streak whenever you open it
+    nav_home.click(refresh_stats, user_state, stats_outputs, show_progress="hidden")
+
+    # Create a quiz (one at a time, so the model doesn't run out of memory)
     generate_btn.click(
         generate_quiz,
-        inputs=[notes_file, topic_box, count_slider],
+        inputs=[user_state, notes_file, notes_box, count_slider, seconds_slider, max_players],
         outputs=generate_msg,
+        show_progress="minimal",
+        concurrency_limit=1,
+    )
+
+    # Join and play
+    join_btn.click(
+        join_game,
+        inputs=[user_state, code_box, nick_box],
+        outputs=play_outputs,
         show_progress="hidden",
     )
-    join_btn.click(
-        join_game, inputs=[code_box, nick_box], outputs=join_msg, show_progress="hidden"
-    )
+    play_submit.click(
+        submit_answer,
+        inputs=[user_state, play_state, play_choice],
+        outputs=play_outputs,
+        show_progress="hidden",
+    ).then(refresh_stats, user_state, stats_outputs, show_progress="hidden")
+    play_timer.tick(tick, inputs=play_state, outputs=play_clock, show_progress="hidden")
+
+    # Ranks: refresh when opened, on the button, and every 5 seconds while it is open
+    for button, name in zip(nav_buttons, VIEWS):
+        button.click(timer_for(name), inputs=None, outputs=board_timer, show_progress="hidden")
+    nav_board.click(render_board, board_code, board_md, show_progress="hidden")
+    board_btn.click(render_board, board_code, board_md, show_progress="hidden")
+    board_code.submit(render_board, board_code, board_md, show_progress="hidden")
+    board_timer.tick(render_board, board_code, board_md, show_progress="hidden")
 
 
 if __name__ == "__main__":
