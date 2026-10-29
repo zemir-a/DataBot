@@ -13,7 +13,7 @@ from transformers import (
 )
 
 # ---------- 1. Load model and data ----------
-MODEL = "google/flan-t5-base"  
+MODEL = "google/flan-t5-small"  
 tok = AutoTokenizer.from_pretrained(MODEL)
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
 
@@ -151,5 +151,5 @@ for ex in ds["test"].select(range(5)):
 # ---------- 5. Publish to Hugging Face (already done) ----------
 # from huggingface_hub import login
 # login()  
-# model.push_to_hub("banwaa/mcq-generator")
-# tok.push_to_hub("banwaa/mcq-generator")
+# model.push_to_hub("banwaa/generator-mcq")
+# tok.push_to_hub("banwaa/generator-mcq")

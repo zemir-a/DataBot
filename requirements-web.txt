@@ -1,1 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 gradio==6.30.0
+torch
+transformers
+sentencepiece
+pypdf
+psycopg2-binary
